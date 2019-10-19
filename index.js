@@ -6,8 +6,14 @@ const fs = require('fs');
 const url = require('url');
 const http = require('http');
 const repl = require('repl');
+const { processTopLevelAwait } = require("node-repl-await");
 
-// const DEFAULT_PORT = 9223;
+function isRecoverableError(error) {
+    if (error.name === 'SyntaxError') {
+        return /^(Unexpected end of input|Unexpected token)/.test(error.message);
+    }
+    return false;
+}
 
 const _makeBufferCat = onmessage => {
   const bs = [];
@@ -54,15 +60,20 @@ const _makeBufferCat = onmessage => {
   };
 };
 
-module.exports = (opts, cb) => {
+const {promisify} = require('util');
+module.exports = (opts, cb = null) => (promisify((opts, cb) => {
   if (typeof opts === 'function') {
     cb = opts;
     opts = undefined;
   }
   opts = opts || {};
-  const {port = null} = opts;
+  const os = require('os');
+  const {port = null, banner = () => `Connected to PID ${process.pid} [${process.title}] at ${os.hostname()} (Node ${process.version})`, evalFn = f => eval(f)} = opts;
 
   const _makeRepl = (socket, id) => {
+    const bannerText = typeof banner === 'function' ? banner() : banner;
+    if (bannerText) socket.send(Buffer.from(bannerText + '\n'));
+
     let live = true;
 
     const input = new stream.Readable();
@@ -80,11 +91,32 @@ module.exports = (opts, cb) => {
       console.log('output data', d);
     });
     const _makeInstance = () => repl.start({
-      prompt: '[x] ',
+      prompt: '> ',
       input,
       output,
-      eval(s, context, filename, cb) {
-        localEval(s, context, filename, cb);
+      async eval(s, context, filename, cb) {
+        const oldS = s;
+        s = processTopLevelAwait(s) || s;
+        const isAsync = s !== oldS;
+        if (process.env.PRINT_REPL_COMMANDS) console.log('Executing from REPL:', s);
+      
+        try {
+          let result = (await new Promise((resolve, reject) => {
+            localEval(s, context, filename, (err, value) => {
+              if (err) return reject(err);
+              resolve(() => value); // Wrap in function to avoid automatic promise chaining
+            });
+          }))();
+          if (isAsync) result = await result;
+          cb(null, result);
+        } catch (e) {
+          if (isRecoverableError(e)) {
+            cb(new repl.Recoverable(e));
+          } else {
+            cb(e);
+          }
+        }
+        //localEval(s, context, filename, cb);
       },
       global: true,
       terminal: true,
@@ -100,6 +132,7 @@ module.exports = (opts, cb) => {
     };
     let r = _makeInstance();
     _bindInstance(r);
+
     socket.on('message', m => {
       const j = JSON.parse(m);
       const {method, args} = j;
@@ -122,9 +155,23 @@ module.exports = (opts, cb) => {
       r.close();
     });
 
-    let localEval = () => {};
+    let localEval = (s, context, filename, cb) => {
+      let err = null, result;
+      try {
+        result = evalFn(s);
+      } catch (e) {
+        err = e;
+      }
+      if (!err) {
+        cb(null, result);
+      } else {
+        cb(err);
+      }
+    };
+    
     return {
       id,
+      socket,
       setEval(newEval) {
         localEval = newEval;
       },
@@ -134,7 +181,7 @@ module.exports = (opts, cb) => {
     };
   };
   const replServer = new EventEmitter();
-  replServer.url = port ? `http://127.0.0.1:${port}/?protocol=websocket` : `file://${path.join(__dirname, 'index.html')}?protocol=message`;
+  replServer.url = port ? `http://127.0.0.1:${port}/` : `file://${path.join(__dirname, 'index.html')}?protocol=message`;
   replServer.createConnection = u => {
     const {query} = url.parse(u, true);
     const {id} = query;
@@ -152,6 +199,7 @@ module.exports = (opts, cb) => {
     };
 
     const r = _makeRepl(socket, id);
+
     replServer.emit('repl', r);
 
     return socket;
@@ -188,7 +236,7 @@ module.exports = (opts, cb) => {
     });
     server.on('upgrade', (request, socket, head) => {
       wss.handleUpgrade(request, socket, head, ws => {
-        const {query} = url.parse(req.url, true);
+        const {query} = url.parse(request.url, true);
         const {id} = query;
 
         const r = _makeRepl(ws, id);
@@ -196,7 +244,7 @@ module.exports = (opts, cb) => {
       });
     });
     server.on('error', cb);
-    server.listen(port, () => {
+    server.listen(port, '127.0.0.1', () => {
       cb(null, replServer);
     });
   } else {
@@ -204,4 +252,14 @@ module.exports = (opts, cb) => {
       cb(null, replServer);
     });
   }
-};
+}))(opts).then(v => {
+  if (cb) cb(null, v);
+  return v;
+}, e => {
+  if (cb) cb(e, null);
+  throw e;
+});
+
+if (require.main === module) {
+  module.exports({ port: process.env.PORT || 9090 }).then(srv => console.log(`REPL listening on ${srv.url}`), e => { setImmediate(() => { throw e; }) });
+}

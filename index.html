@@ -55,7 +55,9 @@ body {
   })();
 
   const query = parseQuery(window.location.search);
-  const {id, protocol} = query;
+  let {id, protocol} = query;
+  if (!id) id = '0';
+  if (!protocol) protocol = 'websocket';
 
   const _makeProtocolSocket = ({id, protocol}, cb) => {
     if (protocol === 'websocket') {
@@ -159,11 +161,22 @@ body {
         buf = '';
       } */
 
+      let okay = true;
       const _send = s => {
-        socket.send(JSON.stringify({
-          method: 'c',
-          args: s,
-        }));
+        try {
+          if (!okay) return;
+          if (socket.readyState === socket.CLOSED || socket.readyState === socket.CLOSING) {
+            okay = false;
+            throw 'Websocket connection died - please reload page';
+          }
+          socket.send(JSON.stringify({
+            method: 'c',
+            args: s,
+          }));
+        } catch (e) {
+          console.error(e);
+          term.io.writeUTF8('\n[ERR] ' + e + '\n');
+        }
       };
       term.io.onVTKeystroke = _send;
       term.io.sendString = _send;
@@ -185,6 +198,7 @@ body {
       });
     } else {
       console.warn(err.stack);
+      term.io.writeUTF8('\n[ERR] ' + err + '\n');
     }
   });
 </script>
